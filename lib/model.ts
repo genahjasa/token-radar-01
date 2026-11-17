@@ -564,3 +564,162 @@ export function boardIssue(board: BoardRow[], snapshot: Snapshot): string | null
 export function dataScript(radar: RadarData): string {
   return `window.RADAR=${JSON.stringify(radar)};\n`;
 }
+
+/*
+ * Diagnostics: a second, independent look at the finished board, printed by main.ts after the
+ * files are written. None of this feeds board.json or data.js, so the summary can grow without
+ * moving a single ranked row: it describes the board's shape, how wide each row's value band is
+ * when the live-token ratios spread, and whether anything in it fails a fresh validation.
+ */
+
+/** One quartile of a sorted list, interpolated between neighbours. */
+export function quartile(sorted: number[], q: number): number {
+  if (sorted.length === 0) return NaN;
+  if (sorted.length === 1) return sorted[0]!;
+  const at = (sorted.length - 1) * q;
+  const lo = Math.floor(at);
+  const hi = Math.ceil(at);
+  return sorted[lo]! + (sorted[hi]! - sorted[lo]!) * (at - lo);
+}
+
+/** The live-token market-cap / TVL ratios, sorted ascending, per category and overall. */
+export function categoryRatioLists(snapshot: Snapshot): { byCategory: Map<string, number[]>; all: number[] } {
+  const byCategory = new Map<string, number[]>();
+  const all: number[] = [];
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.mcap_usd <= 0 || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    all.push(ratio);
+    const key = p.category ?? 'Other';
+    const list = byCategory.get(key);
+    if (list) list.push(ratio);
+    else byCategory.set(key, [ratio]);
+  }
+  const byAscending = (a: number, b: number): number => a - b;
+  for (const list of byCategory.values()) list.sort(byAscending);
+  all.sort(byAscending);
+  return { byCategory, all };
+}
+
+/** The value band one row carries: its implied value stretched by its category's ratio quartiles. */
+export function confidenceBand(
+  implied: number,
+  ratios: number[],
+  globalRatios: number[],
+): { low: number; high: number; widthRatio: number } {
+  const use = ratios.length >= 3 ? ratios : globalRatios;
+  const med = median(use);
+  if (!Number.isFinite(med) || med <= 0 || use.length === 0) return { low: implied, high: implied, widthRatio: 1 };
+  const low = Math.max(1, Math.round(implied * (quartile(use, 0.25) / med)));
+  const high = Math.max(low, Math.round(implied * (quartile(use, 0.75) / med)));
+  return { low, high, widthRatio: high / low };
+}
+
+/** The value bands the board's rows fall into, from the top down. */
+export const VALUE_BANDS = [
+  { label: 'over $100M', min: 100_000_000 },
+  { label: '$10M–$100M', min: 10_000_000 },
+  { label: '$1M–$10M', min: 1_000_000 },
+  { label: 'under $1M', min: 0 },
+];
+
+/** Everything the run's printed summary says about the finished board. */
+export interface BoardDiagnostics {
+  rows: number;
+  watchlistRows: number;
+  earlyRows: number;
+  categories: number;
+  fallbackRows: number;
+  impliedTotal: number;
+  impliedMedian: number;
+  impliedMin: number;
+  impliedMax: number;
+  medianBandWidth: number;
+  widestBandSlug: string;
+  widestBandWidth: number;
+  bands: { label: string; count: number }[];
+  findings: string[];
+}
+
+/** The finished board's shape, value spread, confidence bands and a fresh validation pass. */
+export function boardDiagnostics(board: BoardRow[], snapshot: Snapshot): BoardDiagnostics {
+  const ratios = categoryRatioLists(snapshot);
+  // Bands use the same winsorised ratios the model prices with, so a band never describes a
+  // multiple the model itself refuses to pay.
+  const clampRatio = (v: number): number => Math.min(MODEL.comps_cap, Math.max(MODEL.comps_floor, v));
+  const bandRatios = new Map<string, number[]>();
+  for (const [category, list] of ratios.byCategory) bandRatios.set(category, list.map(clampRatio));
+  const bandGlobal = ratios.all.map(clampRatio);
+  const comps = buildComps(snapshot);
+  const impliedSorted = board.map((r) => r.implied_value_usd).sort((a, b) => a - b);
+  const widths: number[] = [];
+  let widestBandSlug = '';
+  let widestBandWidth = 1;
+  let fallbackRows = 0;
+  for (const row of board) {
+    const entry = comps.table.find((c) => c.category === (row.category ?? 'Other'));
+    if (entry?.fallback) fallbackRows += 1;
+    const list = bandRatios.get(row.category ?? 'Other') ?? [];
+    const band = confidenceBand(row.implied_value_usd, list, bandGlobal);
+    widths.push(band.widthRatio);
+    if (band.widthRatio > widestBandWidth) {
+      widestBandWidth = band.widthRatio;
+      widestBandSlug = row.slug;
+    }
+  }
+  const findings: string[] = [];
+  const seen = new Set<string>();
+  for (const row of board) {
+    if (seen.has(row.slug)) findings.push(`${row.slug} appears twice on the board`);
+    seen.add(row.slug);
+  }
+  for (let i = 0; i < board.length; i++) {
+    if (board[i]!.rank !== i + 1) findings.push(`rank ${i + 1} is ${board[i]!.rank}`);
+    if (i > 0 && board[i]!.implied_value_usd > board[i - 1]!.implied_value_usd) {
+      findings.push(`row ${i + 1} outranks row ${i} on implied value`);
+    }
+    if (!Number.isSafeInteger(board[i]!.implied_value_usd) || board[i]!.implied_value_usd <= 0) {
+      findings.push(`${board[i]!.slug} has implied value ${board[i]!.implied_value_usd}`);
+    }
+    if (board[i]!.farm_steps.length < 3 || board[i]!.farm_steps.length > 12) {
+      findings.push(`${board[i]!.slug} has ${board[i]!.farm_steps.length} farm steps`);
+    }
+  }
+  for (const slug of snapshot.watchlist) {
+    if (!seen.has(slug)) findings.push(`the board misses watchlist slug ${slug}`);
+  }
+  return {
+    rows: board.length,
+    watchlistRows: board.filter((r) => snapshot.watchlist.includes(r.slug)).length,
+    earlyRows: board.filter((r) => !snapshot.watchlist.includes(r.slug)).length,
+    categories: new Set(board.map((r) => r.category ?? 'Other')).size,
+    fallbackRows,
+    impliedTotal: impliedSorted.reduce((sum, v) => sum + v, 0),
+    impliedMedian: median(impliedSorted),
+    impliedMin: impliedSorted[0] ?? 0,
+    impliedMax: impliedSorted[impliedSorted.length - 1] ?? 0,
+    medianBandWidth: median(widths.sort((a, b) => a - b)),
+    widestBandSlug,
+    widestBandWidth,
+    bands: VALUE_BANDS.map((band, i) => ({
+      label: band.label,
+      count: board.filter((r) => r.implied_value_usd >= band.min && (i === 0 || r.implied_value_usd < VALUE_BANDS[i - 1]!.min)).length,
+    })),
+    findings,
+  };
+}
+
+/** The diagnostics as the run prints them: one line per fact, money in whole dollars. */
+export function diagnosticsText(d: BoardDiagnostics): string {
+  const money = (n: number): string => `$${Math.round(n).toLocaleString('en-US')}`;
+  const lines = [
+    `token radar diagnostics: ${d.rows} rows (${d.watchlistRows} watchlist, ${d.earlyRows} early) across ${d.categories} categories`,
+    `token radar diagnostics: implied value ${money(d.impliedMin)} to ${money(d.impliedMax)}, median ${money(d.impliedMedian)}, total ${money(d.impliedTotal)}`,
+    `token radar diagnostics: confidence bands from live-token quartiles: median width ${d.medianBandWidth.toFixed(2)}x, widest ${d.widestBandWidth.toFixed(2)}x (${d.widestBandSlug})`,
+    `token radar diagnostics: value bands: ${d.bands.map((b) => `${b.count} ${b.label}`).join(' · ')}`,
+    `token radar diagnostics: ${d.fallbackRows} rows priced on the global median fallback`,
+    `token radar diagnostics: ${d.findings.length} finding${d.findings.length === 1 ? '' : 's'}${d.findings.length > 0 ? `: ${d.findings.slice(0, 3).join('; ')}` : ''}`,
+  ];
+  return `${lines.join('\n')}\n`;
+}
