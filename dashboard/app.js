@@ -8,7 +8,7 @@
   var DATA = window.RADAR;
   if (!DATA) return;
   var app = document.getElementById('board');
-  var state = { q: '', category: 'all', chain: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null };
+  var state = { q: '', category: 'all', chain: 'all', tab: 'pre-token', sort: 'implied', dir: -1, selected: null, deepDive: null, watchlistOnly: false };
   var watchSet = {};
   (DATA.watchlist || []).forEach(function (s) { watchSet[s] = true; });
 
@@ -120,6 +120,96 @@
     ].map(stepText);
   }
 
+  // A CSV of exactly the rows the table shows, in the order it shows them, so a reader can
+  // take the board into a spreadsheet without retyping a number. Fields are quoted when they
+  // need it; the download is a blob, so the page still makes no request.
+  function csvCell(value) {
+    var s = value === null || value === undefined ? '' : String(value);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function boardCsv(list) {
+    var head = ['rank', 'protocol', 'category', 'chains', 'tvl_usd', 'change_7d_pct', 'age_days', 'implied_value_usd'];
+    var lines = [head.join(',')];
+    list.forEach(function (r) {
+      lines.push([
+        r.rank, r.name, r.category || 'Other', (r.chains || []).join(' '), r.tvl_usd,
+        r.change_7d === null ? '' : r.change_7d, r.age_days === null ? '' : r.age_days, r.implied_value_usd
+      ].map(csvCell).join(','));
+    });
+    return lines.join('\n') + '\n';
+  }
+  function downloadCsv() {
+    if (state.tab !== 'pre-token') return;
+    var blob = new Blob([boardCsv(sortedRows(rows()))], { type: 'text/csv' });
+    var link = document.createElement('a');
+    link.href = window.URL.createObjectURL(blob);
+    link.download = 'token-radar-board.csv';
+    document.body.appendChild(link);
+    link.click();
+    window.URL.revokeObjectURL(link.href);
+    link.remove();
+  }
+
+  // A category deep-dive: the comparables table is clickable, and a click filters the board
+  // to that category and opens this panel with the category's own figures — how many rows it
+  // holds, how much implied value it carries, its median row, and the multiple behind it.
+  function categoryStats(category) {
+    var list = DATA.rows.filter(function (r) { return (r.category || 'Other') === category; });
+    if (list.length === 0) return null;
+    var values = list.map(function (r) { return r.implied_value_usd; }).sort(function (a, b) { return a - b; });
+    var mid = Math.floor(values.length / 2);
+    var median = values.length % 2 === 1 ? values[mid] : Math.round((values[mid - 1] + values[mid]) / 2);
+    var total = values.reduce(function (sum, v) { return sum + v; }, 0);
+    var watch = list.filter(function (r) { return watchSet[r.slug]; }).length;
+    var chains = {};
+    list.forEach(function (r) { (r.chains || []).forEach(function (c) { chains[c] = (chains[c] || 0) + 1; }); });
+    var topChains = Object.keys(chains).sort(function (a, b) { return chains[b] - chains[a]; }).slice(0, 3);
+    var comps = DATA.comps.filter(function (c) { return c.category === category; })[0];
+    return { category: category, count: list.length, watch: watch, total: total, median: median, top: list[0], chains: topChains, comps: comps || null };
+  }
+  function deepDivePanel() {
+    if (!state.deepDive) return null;
+    var s = categoryStats(state.deepDive);
+    if (!s) return null;
+    var multiple = s.comps ? fmtMult(s.comps.multiple) : fmtMult(DATA.global_comps_multiple);
+    var note = s.comps && !s.comps.fallback
+      ? 'Priced at the category median of ' + s.comps.n + ' live tokens.'
+      : 'Priced at the global median: too few live tokens in this category for its own multiple.';
+    return el('section', { class: 'panel deep-dive', 'aria-label': 'Category deep dive' },
+      el('div', { class: 'deep-head' },
+        el('div', null,
+          el('h2', { text: s.category }),
+          el('p', { class: 'sub', text: s.count + ' pre-token protocols · ' + s.watch + ' on the watchlist · top chain' + (s.chains.length === 1 ? '' : 's') + ' ' + (s.chains.join(', ') || 'none named') })
+        ),
+        el('button', { class: 'button', type: 'button', text: 'Close deep dive', onclick: function () { state.deepDive = null; render(); } })
+      ),
+      el('div', { class: 'deep-stats' },
+        el('div', { class: 'fact' }, el('span', { text: 'Total implied value' }), el('b', { text: fmtUsd(s.total) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Median row' }), el('b', { text: fmtUsd(s.median) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Strongest row' }), el('b', { text: s.top.name + ' · ' + fmtUsd(s.top.implied_value_usd) })),
+        el('div', { class: 'fact' }, el('span', { text: 'Category multiple' }), el('b', { text: multiple }))
+      ),
+      el('p', { class: 'sub', text: note + ' Select a row below for its model and farm plan.' })
+    );
+  }
+
+  // Keyboard shortcuts, for readers who live in the table: / finds, 1 and 2 switch the
+  // pre-token and live views, c downloads the CSV, Escape closes the detail and the dive.
+  // They never fire while the reader is typing in a field.
+  function typingIn(target) {
+    return target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA');
+  }
+  function shortcutsHint() {
+    return el('p', { class: 'hint' },
+      'Shortcuts: ',
+      el('kbd', { text: '/' }), ' search · ',
+      el('kbd', { text: '1' }), ' pre-token · ',
+      el('kbd', { text: '2' }), ' live · ',
+      el('kbd', { text: 'c' }), ' download CSV · ',
+      el('kbd', { text: 'Esc' }), ' close'
+    );
+  }
+
   function readHash() {
     var hash = window.location.hash.replace(/^#/, '');
     if (!hash) return;
@@ -145,8 +235,9 @@
   function rows() {
     var q = state.q.trim().toLowerCase();
     return DATA.rows.filter(function (r) {
-      if (state.category !== 'all' && r.category !== state.category) return false;
+      if (state.category !== 'all' && (r.category || 'Other') !== state.category) return false;
       if (state.chain !== 'all' && !(r.chains || []).some(function (c) { return c === state.chain; })) return false;
+      if (state.watchlistOnly && !watchSet[r.slug]) return false;
       if (!q) return true;
       var hay = [r.name, r.slug, r.category, (r.chains || []).join(' ')].join(' ').toLowerCase();
       return hay.indexOf(q) >= 0;
@@ -224,11 +315,16 @@
     chainSelect.addEventListener('change', function () { state.chain = chainSelect.value; writeHash(); render(); });
     var pre = el('button', { type: 'button', 'aria-pressed': state.tab === 'pre-token' ? 'true' : 'false', text: 'Pre-token', onclick: function () { state.tab = 'pre-token'; render(); } });
     var live = el('button', { type: 'button', 'aria-pressed': state.tab === 'live' ? 'true' : 'false', text: 'Live token', onclick: function () { state.tab = 'live'; render(); } });
+    var csv = el('button', { type: 'button', class: 'button', text: 'Download CSV', onclick: function () { downloadCsv(); } });
+    var watchOnly = el('input', { type: 'checkbox', id: 'watch-only', checked: state.watchlistOnly ? 'checked' : null });
+    watchOnly.addEventListener('change', function () { state.watchlistOnly = watchOnly.checked; render(); });
     return el('div', { class: 'controls' },
       el('div', { class: 'field' }, el('label', { for: 'q', text: 'Search' }), search),
       el('div', { class: 'field' }, el('label', { for: 'category', text: 'Category' }), select),
       el('div', { class: 'field' }, el('label', { for: 'chain', text: 'Chain' }), chainSelect),
       el('div', { class: 'field' }, el('span', { class: 'sub', text: 'Token status' }), el('div', { class: 'tabs' }, pre, live)),
+      el('div', { class: 'field check' }, el('label', { for: 'watch-only', text: 'Watchlist only' }), watchOnly),
+      el('div', { class: 'field' }, el('label', { text: 'Export' }), csv),
       el('span', { class: 'count', text: state.tab === 'pre-token' ? rows().length + ' rows shown' : DATA.live.length + ' live-token protocols' })
     );
   }
@@ -320,6 +416,32 @@
     );
   }
 
+  // Where the board's rows land by implied value: four bands, counted from the same rows the
+  // table shows, so the shape of the ranking is visible without scrolling the whole board.
+  function valueBands() {
+    var bands = [
+      { label: 'Over $100M', min: 1e8 },
+      { label: '$10M–$100M', min: 1e7 },
+      { label: '$1M–$10M', min: 1e6 },
+      { label: 'Under $1M', min: 0 },
+    ];
+    var top = 0;
+    var counts = bands.map(function (band, i) {
+      var count = DATA.rows.filter(function (r) { return r.implied_value_usd >= band.min && (i === 0 || r.implied_value_usd < bands[i - 1].min); }).length;
+      if (count > top) top = count;
+      return { label: band.label, count: count };
+    });
+    return el('div', { class: 'bands' },
+      counts.map(function (b) {
+        return el('div', { class: 'band' },
+          el('span', { text: b.label }),
+          el('div', { class: 'bar', 'aria-hidden': 'true' }, el('i', { style: 'width:' + Math.max(3, Math.round((b.count / (top || 1)) * 100)) + '%' })),
+          el('b', { class: 'num', text: String(b.count) })
+        );
+      })
+    );
+  }
+
   function modelPanel() {
     var m = DATA.model;
     return el('section', { class: 'panel model' },
@@ -328,6 +450,7 @@
       el('div', { class: 'formula' },
         'implied = round( tvl_usd x comps_multiple(category) x (1 + clamp(change_7d, ' + m.growth_floor + ', ' + m.growth_cap + ') / 100 x ' + m.growth_weight + ') x (' + m.maturity_floor + ' + min(age_days, ' + m.maturity_days + ') / ' + m.maturity_days + ' x ' + m.maturity_range + ') )'
       ),
+      valueBands(),
       el('p', { class: 'sub', text: 'The multiple is what the market already pays for a token in this category: the median market-cap to TVL of the live-token protocols in the same category, from this snapshot. Categories with fewer than ' + m.comps_min_n + ' live tokens use the global median of ' + fmtMult(DATA.global_comps_multiple) + '. Multiples are winsorised to ' + m.comps_floor + 'x–' + m.comps_cap + 'x, so one outlier cannot set the price. Age is the time since the protocol was first listed, the best record of how long it has run with no token; an unlisted age uses ' + m.unknown_age_days + ' days.' })
     );
   }
@@ -336,8 +459,12 @@
     var rows = DATA.comps.slice().sort(function (a, b) { return b.n - a.n || (a.category < b.category ? -1 : 1); });
     var tbody = el('tbody');
     rows.forEach(function (c) {
+      var hasRows = DATA.rows.some(function (r) { return (r.category || 'Other') === c.category; });
+      var nameCell = hasRows
+        ? el('button', { type: 'button', class: 'link-button', text: c.category, title: 'Filter the board to ' + c.category + ' and open its deep dive', onclick: function () { state.deepDive = c.category; state.category = c.category; writeHash(); render(); } })
+        : el('b', { text: c.category });
       tbody.appendChild(el('tr', null,
-        el('td', null, el('b', { text: c.category })),
+        el('td', null, nameCell),
         el('td', { class: 'num', text: fmtMult(c.multiple) }),
         el('td', { class: 'num', text: String(c.n) }),
         el('td', null, el('span', { class: 'sub', text: c.fallback ? 'global median (too few live tokens)' : 'category median' }))
@@ -353,6 +480,18 @@
         )
       )
     );
+  }
+
+  // Copy the six-step plan to the clipboard, numbered, so a reader can paste it into a farm
+  // log. The button says so when it worked; where the clipboard is unavailable the plan
+  // simply stays on screen.
+  function copyFarmPlan(steps, button) {
+    var text = steps.map(function (s, i) { return (i + 1) + '. ' + s; }).join('\n');
+    if (!navigator.clipboard || !navigator.clipboard.writeText) return;
+    navigator.clipboard.writeText(text).then(function () {
+      button.textContent = 'Copied to clipboard';
+      window.setTimeout(function () { button.textContent = 'Copy farm plan'; }, 2000);
+    }).catch(function () { /* the plan stays on screen */ });
   }
 
   var dialog = el('dialog', { class: 'detail', id: 'detail', 'aria-labelledby': 'detail-title' });
@@ -398,7 +537,8 @@
         var action = at >= 0 ? s.slice(0, at) : s;
         var tail = at >= 0 ? s.slice(at + 1) : '';
         return el('li', null, el('b', { text: action }), el('span', { class: 'cost', text: tail }));
-      }))
+      })),
+      el('button', { class: 'button', type: 'button', text: 'Copy farm plan', onclick: function (e) { copyFarmPlan(steps, e.currentTarget); } })
     ));
     if (typeof dialog.showModal === 'function') {
       if (!dialog.open) dialog.showModal();
@@ -414,6 +554,9 @@
     shell.appendChild(lede());
     shell.appendChild(spotlight());
     shell.appendChild(controls());
+    shell.appendChild(shortcutsHint());
+    var dive = deepDivePanel();
+    if (dive) shell.appendChild(dive);
     shell.appendChild(state.tab === 'pre-token' ? boardTable() : liveTable());
     if (state.tab === 'pre-token') { shell.appendChild(modelPanel()); shell.appendChild(compsPanel()); }
     app.appendChild(shell);
@@ -425,6 +568,21 @@
   readHash();
   render();
   window.addEventListener('keydown', function (e) {
-    if (e.key === 'Escape' && dialog.open) dialog.close();
+    if (e.key === 'Escape' && dialog.open) { dialog.close(); return; }
+    if (e.key === 'Escape' && state.deepDive) { state.deepDive = null; render(); return; }
+    if (typingIn(e.target) || e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === '/') { e.preventDefault(); var q = document.getElementById('q'); if (q) q.focus(); }
+    else if (e.key === '1' && state.tab !== 'pre-token') { state.tab = 'pre-token'; render(); }
+    else if (e.key === '2' && state.tab !== 'live') { state.tab = 'live'; render(); }
+    else if ((e.key === 'c' || e.key === 'C') && state.tab === 'pre-token') { downloadCsv(); }
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      var list = sortedRows(rows());
+      if (list.length === 0) return;
+      var at = -1;
+      list.forEach(function (r, i) { if (r.slug === state.selected) at = i; });
+      var next = at < 0 ? 0 : e.key === 'ArrowDown' ? Math.min(list.length - 1, at + 1) : Math.max(0, at - 1);
+      e.preventDefault();
+      openDetail(list[next].slug);
+    }
   });
 })();
